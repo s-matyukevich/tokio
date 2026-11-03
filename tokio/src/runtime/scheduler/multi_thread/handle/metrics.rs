@@ -51,5 +51,9 @@ impl Handle {
         pub(crate) fn blocking_queue_depth(&self) -> usize {
             self.blocking_spawner.queue_depth()
         }
+
+        pub(crate) fn inject_stall(&self) -> Option<&crate::runtime::metrics::StallTime> {
+            self.shared.inject_stall.as_ref()
+        }
     }
 }

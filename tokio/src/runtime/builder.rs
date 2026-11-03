@@ -144,6 +144,9 @@ pub struct Builder {
     /// Configures the task schedule latency histogram.
     pub(super) metrics_schedule_latency_histogram: HistogramBuilder,
 
+    /// When true, enables PSI-style stall tracking.
+    pub(super) metrics_stall_tracking: bool,
+
     #[cfg(tokio_unstable)]
     pub(super) unhandled_panic: UnhandledPanic,
 
@@ -344,6 +347,8 @@ impl Builder {
             metrics_schedule_latency_histogram_enabled: false,
 
             metrics_schedule_latency_histogram: HistogramBuilder::default(),
+
+            metrics_stall_tracking: false,
 
             disable_lifo_slot: false,
 
@@ -1383,6 +1388,29 @@ impl Builder {
     }
 
     cfg_unstable_metrics! {
+        /// Enables PSI-style stall tracking on the multi-threaded scheduler.
+        ///
+        /// When enabled, each worker accumulates the time during which at
+        /// least one task was runnable on it (in its LIFO slot or local run
+        /// queue) but not being polled, and the time it spent parked. The
+        /// scheduler also accumulates the time the global queue was
+        /// non-empty. Read them with
+        /// [`RuntimeMetrics::worker_total_stall_duration`],
+        /// [`RuntimeMetrics::worker_total_park_duration`] and
+        /// [`RuntimeMetrics::global_queue_total_stall_duration`].
+        ///
+        /// The clock is read only when a tracked condition changes, not on
+        /// every task schedule or poll. Has no effect on the current-thread
+        /// scheduler.
+        ///
+        /// [`RuntimeMetrics::worker_total_stall_duration`]: crate::runtime::RuntimeMetrics::worker_total_stall_duration
+        /// [`RuntimeMetrics::worker_total_park_duration`]: crate::runtime::RuntimeMetrics::worker_total_park_duration
+        /// [`RuntimeMetrics::global_queue_total_stall_duration`]: crate::runtime::RuntimeMetrics::global_queue_total_stall_duration
+        pub fn enable_metrics_stall_tracking(&mut self) -> &mut Self {
+            self.metrics_stall_tracking = true;
+            self
+        }
+
         /// Enables tracking the distribution of task poll times.
         ///
         /// Task poll times are not instrumented by default as doing so requires
@@ -1721,6 +1749,9 @@ impl Builder {
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
                 metrics_schedule_latency_histogram: self
                     .metrics_schedule_latency_histogram_builder(),
+                // Stall tracking is only implemented by the multi-threaded
+                // scheduler.
+                metrics_stall_tracking: false,
             },
             local_tid,
             self.name.clone(),
@@ -2042,6 +2073,7 @@ cfg_rt_multi_thread! {
                     seed_generator: seed_generator_1,
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
                     metrics_schedule_latency_histogram: self.metrics_schedule_latency_histogram_builder(),
+                    metrics_stall_tracking: self.metrics_stall_tracking,
                 },
                 self.timer_flavor,
                 self.name.clone(),

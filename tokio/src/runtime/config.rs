@@ -51,6 +51,9 @@ pub(crate) struct Config {
     /// How to build schedule latency histograms
     pub(crate) metrics_schedule_latency_histogram: Option<crate::runtime::HistogramBuilder>,
 
+    /// When true, the multi-threaded scheduler tracks PSI-style stall time.
+    pub(crate) metrics_stall_tracking: bool,
+
     #[cfg(tokio_unstable)]
     /// How to respond to unhandled task panics.
     pub(crate) unhandled_panic: crate::runtime::UnhandledPanic,

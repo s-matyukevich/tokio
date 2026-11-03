@@ -264,6 +264,10 @@ cfg_rt! {
             pub(crate) fn blocking_queue_depth(&self) -> usize {
                 match_flavor!(self, Handle(handle) => handle.blocking_queue_depth())
             }
+
+            pub(crate) fn inject_stall(&self) -> Option<&crate::runtime::metrics::StallTime> {
+                match_flavor!(self, Handle(handle) => handle.inject_stall())
+            }
         }
     }
 
