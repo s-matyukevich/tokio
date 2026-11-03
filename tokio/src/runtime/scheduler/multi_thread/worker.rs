@@ -1,3 +1,5 @@
+// Datadog patch (dd-source third_party/patches/tokio): experimental
+// PSI-style per-worker stall tracking. Base: tokio-1.53.1.
 //! A scheduler is initialized with a fixed number of workers. Each worker is
 //! driven by a thread. Each worker has a "core" which contains data such as the
 //! run queue and other state. When `block_in_place` is called, the worker's
