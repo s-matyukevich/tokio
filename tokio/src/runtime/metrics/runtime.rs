@@ -398,6 +398,79 @@ impl RuntimeMetrics {
             self.handle.inner.worker_local_queue_depth(worker)
         }
 
+        /// Returns `true` if the runtime tracks PSI-style stall time.
+        ///
+        /// Stall tracking is enabled by calling
+        /// [`enable_metrics_stall_tracking()`] when building a multi-threaded
+        /// runtime.
+        ///
+        /// [`enable_metrics_stall_tracking()`]: crate::runtime::Builder::enable_metrics_stall_tracking
+        pub fn stall_tracking_enabled(&self) -> bool {
+            self.handle.inner.worker_metrics(0).stall.is_some()
+        }
+
+        /// Returns the total time during which at least one task was runnable
+        /// on the given worker (in its LIFO slot or local run queue) but not
+        /// being polled.
+        ///
+        /// This is the worker's equivalent of a CPU's PSI "some" stall time.
+        /// The value includes the in-progress stall, if any, and is
+        /// monotonically increasing, so it can be diffed over any window.
+        /// Returns zero unless [`stall_tracking_enabled()`] is `true`.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()`.
+        ///
+        /// [`stall_tracking_enabled()`]: Self::stall_tracking_enabled
+        pub fn worker_total_stall_duration(&self, worker: usize) -> Duration {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .stall
+                .as_ref()
+                .map_or(Duration::ZERO, |stall| stall.waiting.total())
+        }
+
+        /// Returns the total time the given worker spent parked.
+        ///
+        /// Wall time minus this value is the worker's non-idle time, which
+        /// weights [`worker_total_stall_duration()`] when aggregating across
+        /// workers (as the kernel weights per-CPU stall by non-idle time).
+        /// Monotonically increasing. Returns zero unless
+        /// [`stall_tracking_enabled()`] is `true`.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()`.
+        ///
+        /// [`worker_total_stall_duration()`]: Self::worker_total_stall_duration
+        /// [`stall_tracking_enabled()`]: Self::stall_tracking_enabled
+        pub fn worker_total_park_duration(&self, worker: usize) -> Duration {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .stall
+                .as_ref()
+                .map_or(Duration::ZERO, |stall| stall.parked.total())
+        }
+
+        /// Returns the total time during which the global (injection) queue
+        /// was non-empty.
+        ///
+        /// Monotonically increasing. Returns zero unless
+        /// [`stall_tracking_enabled()`] is `true`.
+        ///
+        /// [`stall_tracking_enabled()`]: Self::stall_tracking_enabled
+        pub fn global_queue_total_stall_duration(&self) -> Duration {
+            self.handle
+                .inner
+                .inject_stall()
+                .map_or(Duration::ZERO, |stall| stall.total())
+        }
+
         /// Returns `true` if the runtime is tracking the distribution of task poll
         /// times.
         ///

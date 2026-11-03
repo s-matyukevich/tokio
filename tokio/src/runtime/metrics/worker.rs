@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use std::thread::ThreadId;
 
 cfg_unstable_metrics! {
-    use crate::runtime::metrics::Histogram;
+    use crate::loom::sync::Arc;
+    use crate::runtime::metrics::{Histogram, WorkerStall};
 }
 
 /// Retrieve runtime worker metrics.
@@ -69,6 +70,11 @@ pub(crate) struct WorkerMetrics {
     #[cfg(feature = "schedule-latency")]
     /// If `Some`, tracks the number of times tasks were scheduled by duration range.
     pub(super) schedule_latency_histogram: Option<Histogram>,
+
+    #[cfg(tokio_unstable)]
+    /// If `Some`, tracks PSI-style stall time. Only populated by the
+    /// multi-threaded scheduler.
+    pub(crate) stall: Option<Arc<WorkerStall>>,
 }
 
 impl WorkerMetrics {

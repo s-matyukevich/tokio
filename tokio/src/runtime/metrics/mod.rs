@@ -28,6 +28,9 @@ cfg_unstable_metrics! {
     mod scheduler;
     pub(crate) use scheduler::SchedulerMetrics;
 
+    mod stall;
+    pub(crate) use stall::{StallTime, WorkerStall};
+
     cfg_net! {
         mod io;
         pub(crate) use io::IoDriverMetrics;

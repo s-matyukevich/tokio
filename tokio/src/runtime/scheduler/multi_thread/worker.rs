@@ -95,6 +95,8 @@ use crate::loom::sync::atomic::AtomicBool;
 use crate::runtime::time_alt;
 
 use crate::runtime::metrics::ScheduleLatencyInstant;
+#[cfg(tokio_unstable)]
+use crate::runtime::metrics::{StallTime, WorkerStall};
 #[cfg(all(tokio_unstable, feature = "time"))]
 use crate::runtime::scheduler::util;
 
@@ -165,6 +167,11 @@ struct Core {
 
     /// Fast random number generator.
     rand: FastRand,
+
+    /// PSI-style stall state of this worker, if enabled. Same as
+    /// `WorkerMetrics::stall` for this worker's index.
+    #[cfg(tokio_unstable)]
+    stall: Option<Arc<WorkerStall>>,
 }
 
 /// State shared across all workers
@@ -204,6 +211,10 @@ pub(crate) struct Shared {
     pub(super) scheduler_metrics: SchedulerMetrics,
 
     pub(super) worker_metrics: Box<[WorkerMetrics]>,
+
+    /// Time the global queue was non-empty, if stall tracking is enabled.
+    #[cfg(tokio_unstable)]
+    pub(super) inject_stall: Option<StallTime>,
 
     /// Startup time of this scheduler.
     ///
@@ -292,7 +303,12 @@ pub(super) fn create(
 
         let park = park.clone();
         let unpark = park.unpark();
-        let metrics = WorkerMetrics::from_config(&config);
+        #[cfg_attr(not(tokio_unstable), allow(unused_mut))]
+        let mut metrics = WorkerMetrics::from_config(&config);
+        #[cfg(tokio_unstable)]
+        if config.metrics_stall_tracking {
+            metrics.stall = Some(WorkerStall::new(Instant::now()));
+        }
         let stats = Stats::new(&metrics);
 
         cores.push(Box::new(Core {
@@ -311,6 +327,8 @@ pub(super) fn create(
             global_queue_interval: stats.tuned_global_queue_interval(&config),
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
+            #[cfg(tokio_unstable)]
+            stall: metrics.stall.clone(),
         }));
 
         remotes.push(Remote { steal, unpark });
@@ -323,6 +341,10 @@ pub(super) fn create(
         .metrics_schedule_latency_histogram
         .as_ref()
         .map(|_| Instant::now());
+    #[cfg(tokio_unstable)]
+    let inject_stall = config
+        .metrics_stall_tracking
+        .then(|| StallTime::new(Instant::now()));
 
     let remotes_len = remotes.len();
     let handle = Arc::new(Handle {
@@ -344,6 +366,8 @@ pub(super) fn create(
             config,
             scheduler_metrics: SchedulerMetrics::new(),
             worker_metrics: worker_metrics.into_boxed_slice(),
+            #[cfg(tokio_unstable)]
+            inject_stall,
             started_at,
             _counters: Counters,
         },
@@ -453,7 +477,7 @@ where
 
         // Since deferred tasks don't stay on `core`, make sure to wake them
         // before blocking.
-        cx.defer.wake();
+        cx.wake_deferred();
 
         // Get the worker core. If none is set, then blocking is fine!
         let mut core = match cx.core.borrow_mut().take() {
@@ -467,6 +491,7 @@ where
         if let Some(task) = core.lifo_slot.take() {
             core.run_queue
                 .push_back_or_overflow(task, &*cx.worker.handle, &mut core.stats);
+            core.sync_stall();
         }
 
         // We are taking the core from the context and sending it to another
@@ -565,7 +590,7 @@ fn run(worker: Arc<Worker>) {
             // Check if there are any deferred tasks to notify. This can happen when
             // the worker core is lost due to `block_in_place()` being called from
             // within the task.
-            cx.defer.wake();
+            cx.wake_deferred();
         });
     });
 }
@@ -684,6 +709,8 @@ impl Context {
                 .prepare(self.worker.handle.shared.started_at),
         );
 
+        self.note_deferred_before_poll();
+
         // Make the core available to the runtime context
         *self.core.borrow_mut() = Some(core);
 
@@ -720,7 +747,9 @@ impl Context {
                 };
 
                 // Check for a task in the LIFO slot
-                let task = match core.lifo_slot.take() {
+                let task = core.lifo_slot.take();
+                core.sync_stall();
+                let task = match task {
                     Some(task) => task,
                     None => {
                         self.reset_lifo_enabled(&mut core);
@@ -739,11 +768,14 @@ impl Context {
                         &*self.worker.handle,
                         &mut core.stats,
                     );
+                    core.sync_stall();
                     // If we hit this point, the LIFO slot should be enabled.
                     // There is no need to reset it.
                     debug_assert!(core.lifo_enabled);
                     return Ok(core);
                 }
+
+                self.note_deferred_before_poll();
 
                 // Track that we are about to run a task from the LIFO slot.
                 lifo_polls += 1;
@@ -834,7 +866,19 @@ impl Context {
                 core.stats
                     .submit(&self.worker.handle.shared.worker_metrics[self.worker.index]);
 
+                #[cfg(tokio_unstable)]
+                let stall = &self.worker.handle.shared.worker_metrics[self.worker.index].stall;
+                #[cfg(tokio_unstable)]
+                if let Some(stall) = stall {
+                    stall.parked.open();
+                }
+
                 core = self.park_internal(core, None);
+
+                #[cfg(tokio_unstable)]
+                if let Some(stall) = stall {
+                    stall.parked.set(false);
+                }
 
                 core.stats.unparked();
 
@@ -889,7 +933,7 @@ impl Context {
             park.park(&self.worker.handle.driver)
         };
 
-        self.defer.wake();
+        self.wake_deferred();
 
         #[cfg(feature = "time")]
         match self.worker.handle.timer_flavor {
@@ -928,6 +972,36 @@ impl Context {
         } else {
             self.defer.defer(waker);
         }
+    }
+
+    /// Called before polling a task. Tasks in the defer list wait for this
+    /// poll to finish, so they count as stalled from here until the list is
+    /// flushed. Deferred tasks that are not passed over (the worker goes
+    /// straight to flushing them) are not counted, as nothing else ran.
+    #[inline]
+    fn note_deferred_before_poll(&self) {
+        #[cfg(tokio_unstable)]
+        if !self.defer.is_empty() {
+            if let Some(stall) = self.stall() {
+                stall.set_deferred(true);
+            }
+        }
+    }
+
+    /// Wakes the tasks in the defer list and records it as empty.
+    fn wake_deferred(&self) {
+        self.defer.wake();
+        #[cfg(tokio_unstable)]
+        if let Some(stall) = self.stall() {
+            stall.set_deferred(false);
+        }
+    }
+
+    #[cfg(tokio_unstable)]
+    fn stall(&self) -> Option<&WorkerStall> {
+        self.worker.handle.shared.worker_metrics[self.worker.index]
+            .stall
+            .as_deref()
     }
 
     #[cfg(all(tokio_unstable, feature = "time"))]
@@ -1140,13 +1214,28 @@ impl Core {
 
             // Push the rest of the on the run queue
             self.run_queue.push_back(tasks);
+            drop(synced);
+            self.sync_stall();
+            worker.handle.sync_inject_stall();
 
             ret
         }
     }
 
     fn next_local_task(&mut self) -> Option<Notified> {
-        self.lifo_slot.take().or_else(|| self.run_queue.pop())
+        let task = self.lifo_slot.take().or_else(|| self.run_queue.pop());
+        self.sync_stall();
+        task
+    }
+
+    /// Reconciles this worker's stall state with its LIFO slot and run queue.
+    /// Must be called after every change to either made by the owner.
+    #[inline]
+    fn sync_stall(&self) {
+        #[cfg(tokio_unstable)]
+        if let Some(stall) = &self.stall {
+            stall.sync(self.lifo_slot.is_some(), self.run_queue.has_tasks());
+        }
     }
 
     /// Function responsible for stealing tasks from another worker
@@ -1176,6 +1265,16 @@ impl Core {
                 .steal
                 .steal_into(&mut self.run_queue, &mut self.stats)
             {
+                // The victim does not observe the steal, so close its stall
+                // interval here if the steal emptied it. Its LIFO slot and
+                // defer list are not stealable and keep the interval open.
+                #[cfg(tokio_unstable)]
+                if let Some(victim) = &worker.handle.shared.worker_metrics[i].stall {
+                    victim
+                        .waiting
+                        .close_if(|| target.steal.is_empty() && !victim.has_unstealable());
+                }
+                self.sync_stall();
                 return Some(task);
             }
         }
@@ -1401,6 +1500,8 @@ impl Handle {
             ret
         };
 
+        core.sync_stall();
+
         // Only notify if not currently parked. If `park` is `None`, then the
         // scheduling is from a resource driver. As notifications often come in
         // batches, the notification is delayed until the park is complete.
@@ -1416,7 +1517,24 @@ impl Handle {
 
         let mut synced = self.shared.synced.lock();
         // safety: passing in correct `idle::Synced`
-        unsafe { self.shared.inject.pop(&mut synced.inject) }
+        let task = unsafe { self.shared.inject.pop(&mut synced.inject) };
+        drop(synced);
+        self.sync_inject_stall();
+        task
+    }
+
+    /// Reconciles the global queue's stall state with its length. Callable
+    /// from any thread after pushing to or popping from the global queue.
+    #[inline]
+    fn sync_inject_stall(&self) {
+        #[cfg(tokio_unstable)]
+        if let Some(stall) = &self.shared.inject_stall {
+            if self.shared.inject.is_empty() {
+                stall.close_if(|| self.shared.inject.is_empty());
+            } else {
+                stall.open();
+            }
+        }
     }
 
     fn push_remote_task(&self, task: Notified) {
@@ -1427,6 +1545,8 @@ impl Handle {
         unsafe {
             self.shared.inject.push(&mut synced.inject, task);
         }
+        drop(synced);
+        self.sync_inject_stall();
     }
 
     #[cfg(all(tokio_unstable, feature = "time"))]
@@ -1554,6 +1674,7 @@ impl Overflow<Arc<Handle>> for Handle {
         unsafe {
             self.shared.inject.push_batch(self, iter);
         }
+        self.sync_inject_stall();
     }
 }
 
